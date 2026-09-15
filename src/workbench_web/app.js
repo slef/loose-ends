@@ -46,7 +46,11 @@ const state = {
   jobDetails: new Map(),
   runLogs: new Map(),
   runLogLoads: new Map(),
+  codexLogs: new Map(),
+  codexLoads: new Set(),
+  codexTimers: new Map(),
   expandedRuns: new Set(),
+  expandedCodexRuns: new Set(),
   expandedJobScopes: new Set(),
   expandedProblemBackgrounds: new Set(),
   dialog: null,
@@ -3345,6 +3349,26 @@ function renderJobDetail(job) {
       });
       section.append(output);
     }
+    const codexExpanded = state.expandedCodexRuns.has(run.id);
+    const codexFooter = node("div", "run-detail-footer");
+    const codexToggle = button(`${codexExpanded ? "Hide" : "Show"} Codex transcript`, () => {
+      if (state.expandedCodexRuns.has(run.id)) state.expandedCodexRuns.delete(run.id);
+      else state.expandedCodexRuns.add(run.id);
+      renderJobDetail(job);
+    }, "run-detail-toggle");
+    codexToggle.setAttribute("aria-expanded", String(codexExpanded));
+    codexToggle.setAttribute("aria-label", `${codexExpanded ? "Hide" : "Show"} Codex transcript for ${presentation.title}`);
+    codexToggle.prepend(node("span", "run-chevron", "›"));
+    codexFooter.append(codexToggle);
+    section.append(codexFooter);
+    if (codexExpanded) {
+      const details = node("div", "run-expanded");
+      const transcript = node("section", "codex-transcripts");
+      transcript.dataset.codexRun = run.id;
+      transcript.append(node("h3", "", "Codex transcript"));
+      details.append(transcript);
+      section.append(details);
+    }
     const detailFooter = node("div", "run-detail-footer");
     const toggle = button(`${expanded ? "Hide" : "Show"} command & output`, () => {
       if (state.expandedRuns.has(run.id)) state.expandedRuns.delete(run.id);
@@ -3437,9 +3461,126 @@ async function refreshRunLog(runId) {
 }
 
 function refreshVisibleRunLogs() {
+  main.querySelectorAll("[data-codex-run]").forEach(element => {
+    refreshCodexLogs(element.dataset.codexRun, element);
+  });
   main.querySelectorAll("[data-run-log]").forEach(log => {
     refreshRunLog(log.dataset.runLog);
   });
+}
+
+function codexItems(text) {
+  const items = new Map();
+  let turn = 0;
+  let sequence = 0;
+  for (const line of text.split("\n")) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (!event || typeof event !== "object") continue;
+    if (event.type === "thread.started" || event.type === "turn.started") turn++;
+    if (event.item && typeof event.item === "object") {
+      items.set(`${turn}:${event.item.id ?? sequence++}`, event.item);
+    } else if (event.type === "error" || event.type === "turn.failed") {
+      items.set(`error:${sequence++}`, { type: "error", text: event.message || event.error?.message || JSON.stringify(event) });
+    } else if (event.type === "turn.completed") {
+      items.set(`usage:${sequence++}`, { type: "usage", text: JSON.stringify(event.usage || {}) });
+    }
+  }
+  return [...items.values()];
+}
+
+function renderCodexTranscript(element, transcripts) {
+  element.replaceChildren(node("h3", "", "Codex transcript"));
+  if (!transcripts.length) {
+    element.append(node("p", "muted", "No saved Codex transcript available yet."));
+  }
+  for (const transcript of transcripts) {
+    element.append(node("h4", "codex-invocation-heading", transcript.label));
+    if (transcript.legacy) {
+      const notice = node("p", "muted");
+      notice.append(node("em", "", "Original prompt unavailable for this historical log."));
+      element.append(notice);
+    }
+    if (transcript.prompt) {
+      const prompt = node("details", "codex-activity");
+      prompt.append(node("summary", "", "Task prompt"), node("pre", "", transcript.prompt));
+      element.append(prompt);
+    }
+    for (const item of codexItems(transcript.events || "")) {
+      if (item.type === "agent_message") {
+        const message = node("article", "codex-message");
+        message.append(markdown(item.text || ""));
+        element.append(message);
+      } else {
+        const activity = node("details", "codex-activity");
+        const detail = item.command || item.query;
+        const label = `${item.type || "unknown"}${detail ? ` · ${detail}` : ""}`;
+        const summary = node("summary");
+        summary.append(node("span", "codex-activity-label", `${label}${item.status ? ` · ${humanize(item.status)}` : ""}`));
+        activity.append(summary);
+        if (detail) activity.append(node("pre", "", detail));
+        activity.append(node("pre", "", item.aggregated_output || item.text || JSON.stringify(item, null, 2)));
+        element.append(activity);
+      }
+    }
+    if (transcript.diagnostics) {
+      const diagnostics = node("details", "codex-activity");
+      diagnostics.append(node("summary", "", "Diagnostics"), node("pre", "", transcript.diagnostics));
+      element.append(diagnostics);
+    }
+  }
+}
+
+async function refreshCodexLogs(runId, element) {
+  const cached = state.codexLogs.get(runId) || [];
+  if (!element.dataset.rendered) {
+    renderCodexTranscript(element, cached);
+    element.dataset.rendered = "true";
+  }
+  if (state.codexLoads.has(runId)) return;
+  clearTimeout(state.codexTimers.get(runId));
+  state.codexTimers.delete(runId);
+  state.codexLoads.add(runId);
+  let pending = true;
+  try {
+    const value = await api(`/api/runs/${runId}/codex`);
+    let changed = value.transcripts.length !== cached.length;
+    for (const entry of value.transcripts) {
+      let transcript = cached.find(value => value.id === entry.id);
+      if (!transcript) { transcript = { ...entry, files: {} }; cached.push(transcript); }
+      for (const kind of ["prompt", "events", "diagnostics"]) {
+        // Older transcripts have no saved prompt.
+        if (kind === "prompt" && !entry.id.startsWith("turn-")) continue;
+        const previous = transcript.files[kind] || {};
+        if (previous.complete) continue;
+        const result = await api(`/api/runs/${runId}/codex?${new URLSearchParams({ id: entry.id, kind, offset: previous.nextOffset || 0 })}`);
+        transcript.files[kind] = result;
+        transcript[kind] = (transcript[kind] || "") + result.text;
+        if (result.text) changed = true;
+      }
+    }
+    state.codexLogs.set(runId, cached);
+    pending = !value.complete || cached.some(transcript =>
+      Object.values(transcript.files).some(file => !file.complete));
+    main.querySelectorAll("[data-codex-run]").forEach(current => {
+      if (current.dataset.codexRun !== runId || (!changed && current === element)) return;
+      const expanded = [...current.querySelectorAll("details")].map(value => value.open);
+      const scrollTop = current.scrollTop;
+      renderCodexTranscript(current, cached);
+      current.querySelectorAll("details").forEach((value, index) => { value.open = expanded[index] || false; });
+      current.scrollTop = scrollTop;
+    });
+  } catch (error) {
+    if (element.isConnected && !cached.length) element.replaceChildren(node("p", "error-box", error.message));
+  } finally {
+    state.codexLoads.delete(runId);
+    if (pending) state.codexTimers.set(runId, setTimeout(() => {
+      state.codexTimers.delete(runId);
+      main.querySelectorAll("[data-codex-run]").forEach(current => {
+        if (current.dataset.codexRun === runId) refreshCodexLogs(runId, current);
+      });
+    }, 2000));
+  }
 }
 
 function refreshVisibleRunElapsed(job) {

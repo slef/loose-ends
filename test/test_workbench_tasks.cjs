@@ -5,10 +5,28 @@ const vm = require("node:vm");
 
 const source = readFileSync(`${__dirname}/../src/workbench_web/app.js`, "utf8");
 const functions = [
-  "latestJobRuns", "retryJob",
+  "latestJobRuns", "retryJob", "codexItems",
   "separateWriteTasks", "taskRequests", "taskRequestOptions", "taskTargetsForRequest",
   "targetKey", "targetCountLabel", "reviewTask", "confirmTask", "collectDialogOptions",
 ].map(name => source.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`, "m"))[0]).join("\n");
+
+test("Codex transcript updates items and keeps repeated IDs in later turns", () => {
+  const context = vm.createContext({});
+  vm.runInContext(functions, context);
+  const events = [
+    { type: "turn.started" },
+    { type: "item.started", item: { id: "item_0", type: "command_execution", status: "in_progress" } },
+    { type: "item.completed", item: { id: "item_0", type: "command_execution", status: "completed", aggregated_output: "done" } },
+    { type: "turn.started" },
+    { type: "item.completed", item: { id: "item_0", type: "agent_message", text: "Hello" } },
+    { type: "turn.failed", error: { message: "failure" } },
+  ].map(value => JSON.stringify(value)).join("\n");
+  const items = context.codexItems(events + "\n--- repair ---\nnull\n{");
+  assert.equal(items.length, 3);
+  assert.equal(items[0].aggregated_output, "done");
+  assert.equal(items[1].text, "Hello");
+  assert.equal(items[2].text, "failure");
+});
 
 test("bulk retry confirms latest failed/partial runs and selects the new task", async () => {
   const control = { disabled: false };

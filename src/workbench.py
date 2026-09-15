@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+from codex_transcripts import transcript_stage
 import mimetypes
 import os
 from pathlib import Path, PurePosixPath
@@ -2146,6 +2147,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self.send_json(self.app.store.get_job(match.group(1)))
             elif match := re.fullmatch(r"/api/runs/([0-9a-f-]+)/log", path):
                 self._send_log(match.group(1), parsed.query)
+            elif match := re.fullmatch(r"/api/runs/([0-9a-f-]+)/codex", path):
+                self._send_codex(match.group(1), parsed.query)
             elif path == "/api/events":
                 self._send_events(parsed.query)
             elif path == "/api/file":
@@ -2410,6 +2413,83 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.end_headers()
             while chunk := temporary.read(1024 * 1024):
                 self.wfile.write(chunk)
+
+    def _send_codex(self, run_id: str, query: str) -> None:
+        run = self.app.store.get_run(run_id)
+        root = Path(run["log_path"]).parent / "codex"
+        transcripts = []
+        stages = {}
+        for folder in sorted(root.glob("turn-*")):
+            try:
+                sources = json.loads((folder / "source.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            files = {"prompt": folder / "prompt.txt"}
+            for name in ("events", "diagnostics"):
+                archived = folder / name
+                source = Path(sources[name])
+                files[name] = archived if archived.is_file() else source
+            transcripts.append((folder.name, files))
+            stages[folder.name] = sources.get("stage") or transcript_stage(Path(sources["events"]))
+        if not transcripts:
+            # Older runs only have installed artifacts. Do not scan unrelated history.
+            directories = dict.fromkeys(Path(path).parent for path in run.get("outputs", []))
+            for directory in directories:
+                for events in sorted(directory.glob("*events.jsonl")):
+                    if events.name.startswith("repair-"):
+                        continue  # Repairs are merged into the primary event stream.
+                    prefix = events.name.removesuffix("events.jsonl")
+                    stages[str(events)] = transcript_stage(events)
+                    transcripts.append((str(events), {
+                        "events": events,
+                        "diagnostics": directory / f"{prefix}run.log",
+                    }))
+        values = parse_qs(query)
+        if "index" not in values and "id" not in values:
+            self.send_json({"complete": run["status"] not in ACTIVE_STATUSES and run["status"] != "queued", "transcripts": [
+                {"index": index, "id": key,
+                 "label": f"Codex {index + 1}" + (f" · {stages[key]}" if stages.get(key) else ""),
+                 "legacy": not key.startswith("turn-")}
+                for index, (key, _) in enumerate(transcripts)
+            ]})
+            return
+        try:
+            index = (
+                next((i for i, (key, _) in enumerate(transcripts) if key == values["id"][0]), -1)
+                if "id" in values else int(values["index"][0])
+            )
+            offset = max(0, int(values.get("offset", ["0"])[0]))
+            if index < 0:
+                raise ValueError()
+            _, files = transcripts[index]
+        except (ValueError, IndexError):
+            raise PlanError("unknown Codex transcript")
+        kind = values.get("kind", ["events"])[0]
+        if kind not in files:
+            raise PlanError("unknown transcript file")
+        path = files[kind]
+        if not _is_allowed_file(path, [root, *self.app.allowed_roots]):
+            raise PlanError("transcript is outside allowed roots")
+        data = b""
+        size = 0
+        if path.is_file():
+            with path.open("rb") as source:
+                size = os.fstat(source.fileno()).st_size
+                offset = min(offset, size)
+                source.seek(offset)
+                for line in source:
+                    # Leave a partial live event for the next poll.
+                    if kind == "events" and not line.endswith(b"\n") and run["status"] in ACTIVE_STATUSES:
+                        break
+                    data += line
+                    if len(data) >= 256_000:
+                        break
+        next_offset = offset + len(data)
+        self.send_json({
+            "text": data.decode("utf-8", errors="replace"),
+            "nextOffset": next_offset,
+            "complete": run["status"] not in ACTIVE_STATUSES and run["status"] != "queued" and next_offset >= size,
+        })
 
     def _send_log(self, run_id: str, query: str) -> None:
         run = self.app.store.get_run(run_id)
