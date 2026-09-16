@@ -541,6 +541,10 @@ button { color: inherit; }
   overflow: auto;
   padding: 4px;
 }
+.catalog-transcript-fold { margin-top: 24px; padding-top: 12px; border-top: 1px solid var(--line); }
+.catalog-transcript-fold > summary { padding: 4px 0; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.catalog-transcript-fold > summary:hover, .catalog-transcript-fold > summary:focus-visible { color: var(--heading); }
+.catalog-transcript-fold[open] > summary { margin-bottom: 8px; }
 .codex-message, .codex-activity {
   min-width: 0;
 }

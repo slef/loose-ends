@@ -51,6 +51,7 @@ const state = {
   codexTimers: new Map(),
   expandedRuns: new Set(),
   expandedCodexRuns: new Set(),
+  expandedTranscriptPanels: new Set(),
   expandedJobScopes: new Set(),
   expandedProblemBackgrounds: new Set(),
   dialog: null,
@@ -2149,6 +2150,7 @@ function renderReviewDetail(item) {
   }));
 
   const tabs = reviewModel.detailTabs(item);
+  tabs.splice(tabs.length - 1, 0, ["codex", "Codex logs"]);
   if (!tabs.some(([key]) => key === state.detailTab)) state.detailTab = tabs[0][0];
   const reports = node("section", "section problem-reports");
   reports.id = "problem-documents";
@@ -2170,6 +2172,12 @@ function renderReviewDetail(item) {
   else if (state.detailTab === "critique") section.append(markdown(item.critique, "No review is installed."));
   else if (state.detailTab === "triage") section.append(markdown(item.triageReport, "Loading triage report…"));
   else if (state.detailTab === "literature") section.append(markdown(item.literatureReport, "No literature report is installed."));
+  else if (state.detailTab === "codex") {
+    section.append(node("p", "muted", "Logs for this attempt, plus the problem’s saved triage and literature review."));
+    section.append(codexTranscript(`/api/review-codex?${new URLSearchParams({
+      key: item.itemKey, version: state.catalog.version || 0,
+    })}`));
+  }
   else {
     if (item.attemptDisplayPath) section.append(node("code", "attempt-path", item.attemptDisplayPath));
     section.append(fileGrid(item.files || []));
@@ -2177,6 +2185,7 @@ function renderReviewDetail(item) {
   reports.append(section);
   shell.append(reports);
   main.replaceChildren(shell);
+  refreshVisibleCodexLogs();
 }
 
 function appendStringList(parent, title, values) {
@@ -2340,7 +2349,9 @@ function renderPapers() {
   if (problemPanel) shell.append(problemPanel);
   shell.append(node("section", "section-title", "Files"));
   shell.append(fileGrid(paper.files));
+  shell.append(catalogTranscriptFold("paper", paper));
   main.replaceChildren(shell);
+  refreshVisibleCodexLogs();
 }
 
 function paperProblemReviews(paperPath) {
@@ -3042,7 +3053,9 @@ function renderManuscripts() {
   const heading = node("div", "section-title");
   heading.append(node("h2", "", "Draft files"));
   shell.append(heading, fileGrid(draft.files));
+  shell.append(catalogTranscriptFold("draft", draft));
   main.replaceChildren(shell);
+  refreshVisibleCodexLogs();
 }
 
 function renderActivity({ preserveDetail = false } = {}) {
@@ -3363,10 +3376,7 @@ function renderJobDetail(job) {
     section.append(codexFooter);
     if (codexExpanded) {
       const details = node("div", "run-expanded");
-      const transcript = node("section", "codex-transcripts");
-      transcript.dataset.codexRun = run.id;
-      transcript.append(node("h3", "", "Codex transcript"));
-      details.append(transcript);
+      details.append(codexTranscript(`/api/runs/${run.id}/codex`));
       section.append(details);
     }
     const detailFooter = node("div", "run-detail-footer");
@@ -3461,11 +3471,44 @@ async function refreshRunLog(runId) {
 }
 
 function refreshVisibleRunLogs() {
-  main.querySelectorAll("[data-codex-run]").forEach(element => {
-    refreshCodexLogs(element.dataset.codexRun, element);
-  });
+  refreshVisibleCodexLogs();
   main.querySelectorAll("[data-run-log]").forEach(log => {
     refreshRunLog(log.dataset.runLog);
+  });
+}
+
+function catalogTranscriptFold(kind, item) {
+  const key = `${kind}:${item.key}`;
+  const source = `/api/catalog-codex?${new URLSearchParams({
+    category: kind, key: item.key, version: state.catalog.version || 0,
+  })}`;
+  const fold = node("details", "catalog-transcript-fold");
+  fold.append(node("summary", "", "Codex logs"));
+  fold.open = state.expandedTranscriptPanels.has(key);
+  if (fold.open) fold.append(codexTranscript(source));
+  fold.addEventListener("toggle", () => {
+    if (fold.open) {
+      state.expandedTranscriptPanels.add(key);
+      if (!fold.querySelector("[data-codex-source]")) fold.append(codexTranscript(source));
+      refreshVisibleCodexLogs();
+    } else {
+      state.expandedTranscriptPanels.delete(key);
+      fold.querySelector("[data-codex-source]")?.remove();
+    }
+  });
+  return fold;
+}
+
+function codexTranscript(source) {
+  const element = node("section", "codex-transcripts");
+  element.dataset.codexSource = source;
+  element.append(node("h3", "", "Codex transcript"));
+  return element;
+}
+
+function refreshVisibleCodexLogs() {
+  main.querySelectorAll("[data-codex-source]").forEach(element => {
+    refreshCodexLogs(element.dataset.codexSource, element);
   });
 }
 
@@ -3531,39 +3574,39 @@ function renderCodexTranscript(element, transcripts) {
   }
 }
 
-async function refreshCodexLogs(runId, element) {
-  const cached = state.codexLogs.get(runId) || [];
+async function refreshCodexLogs(source, element) {
+  const cached = state.codexLogs.get(source) || [];
   if (!element.dataset.rendered) {
     renderCodexTranscript(element, cached);
     element.dataset.rendered = "true";
   }
-  if (state.codexLoads.has(runId)) return;
-  clearTimeout(state.codexTimers.get(runId));
-  state.codexTimers.delete(runId);
-  state.codexLoads.add(runId);
+  if (state.codexLoads.has(source)) return;
+  clearTimeout(state.codexTimers.get(source));
+  state.codexTimers.delete(source);
+  state.codexLoads.add(source);
   let pending = true;
   try {
-    const value = await api(`/api/runs/${runId}/codex`);
+    const value = await api(source);
     let changed = value.transcripts.length !== cached.length;
     for (const entry of value.transcripts) {
       let transcript = cached.find(value => value.id === entry.id);
       if (!transcript) { transcript = { ...entry, files: {} }; cached.push(transcript); }
       for (const kind of ["prompt", "events", "diagnostics"]) {
         // Older transcripts have no saved prompt.
-        if (kind === "prompt" && !entry.id.startsWith("turn-")) continue;
+        if (kind === "prompt" && entry.legacy) continue;
         const previous = transcript.files[kind] || {};
         if (previous.complete) continue;
-        const result = await api(`/api/runs/${runId}/codex?${new URLSearchParams({ id: entry.id, kind, offset: previous.nextOffset || 0 })}`);
+        const result = await api(`${source}${source.includes("?") ? "&" : "?"}${new URLSearchParams({ id: entry.id, kind, offset: previous.nextOffset || 0 })}`);
         transcript.files[kind] = result;
         transcript[kind] = (transcript[kind] || "") + result.text;
         if (result.text) changed = true;
       }
     }
-    state.codexLogs.set(runId, cached);
+    state.codexLogs.set(source, cached);
     pending = !value.complete || cached.some(transcript =>
       Object.values(transcript.files).some(file => !file.complete));
-    main.querySelectorAll("[data-codex-run]").forEach(current => {
-      if (current.dataset.codexRun !== runId || (!changed && current === element)) return;
+    main.querySelectorAll("[data-codex-source]").forEach(current => {
+      if (current.dataset.codexSource !== source || (!changed && current === element)) return;
       const expanded = [...current.querySelectorAll("details")].map(value => value.open);
       const scrollTop = current.scrollTop;
       renderCodexTranscript(current, cached);
@@ -3573,11 +3616,11 @@ async function refreshCodexLogs(runId, element) {
   } catch (error) {
     if (element.isConnected && !cached.length) element.replaceChildren(node("p", "error-box", error.message));
   } finally {
-    state.codexLoads.delete(runId);
-    if (pending) state.codexTimers.set(runId, setTimeout(() => {
-      state.codexTimers.delete(runId);
-      main.querySelectorAll("[data-codex-run]").forEach(current => {
-        if (current.dataset.codexRun === runId) refreshCodexLogs(runId, current);
+    state.codexLoads.delete(source);
+    if (pending) state.codexTimers.set(source, setTimeout(() => {
+      state.codexTimers.delete(source);
+      main.querySelectorAll("[data-codex-source]").forEach(current => {
+        if (current.dataset.codexSource === source) refreshCodexLogs(source, current);
       });
     }, 2000));
   }

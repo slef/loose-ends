@@ -47,6 +47,23 @@ def transcript_stage(events: Path) -> str:
     return stage
 
 
+def artifact_transcripts(directories):
+    """Find installed logs in the requested directories, without scanning history."""
+    transcripts = []
+    stages = {}
+    for directory in dict.fromkeys(directories):
+        for events in sorted(directory.glob("*events.jsonl")):
+            if events.name.startswith("repair-"):
+                continue  # Repairs are merged into the primary event stream.
+            prefix = events.name.removesuffix("events.jsonl")
+            stages[str(events)] = transcript_stage(events)
+            transcripts.append((str(events), {
+                "events": events,
+                "diagnostics": directory / f"{prefix}run.log",
+            }))
+    return transcripts, stages
+
+
 def record_transcript(function):
     @wraps(function)
     def recorded(**kwargs):

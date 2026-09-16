@@ -11,7 +11,7 @@ import hashlib
 import ipaddress
 import json
 import logging
-from codex_transcripts import transcript_stage
+from codex_transcripts import artifact_transcripts, transcript_stage
 import mimetypes
 import os
 from pathlib import Path, PurePosixPath
@@ -2141,6 +2141,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             elif path == "/api/review-detail":
                 key = parse_qs(parsed.query).get("key", [""])[0]
                 self.send_json(self.app.catalog.review_detail(key))
+            elif path == "/api/review-codex":
+                self._send_review_codex(parsed.query)
+            elif path == "/api/catalog-codex":
+                self._send_catalog_codex(parsed.query)
             elif path == "/api/jobs":
                 self.send_json({"jobs": self.app.store.list_jobs()})
             elif match := re.fullmatch(r"/api/jobs/([0-9a-f-]+)", path):
@@ -2432,25 +2436,62 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             transcripts.append((folder.name, files))
             stages[folder.name] = sources.get("stage") or transcript_stage(Path(sources["events"]))
         if not transcripts:
-            # Older runs only have installed artifacts. Do not scan unrelated history.
-            directories = dict.fromkeys(Path(path).parent for path in run.get("outputs", []))
-            for directory in directories:
-                for events in sorted(directory.glob("*events.jsonl")):
-                    if events.name.startswith("repair-"):
-                        continue  # Repairs are merged into the primary event stream.
-                    prefix = events.name.removesuffix("events.jsonl")
-                    stages[str(events)] = transcript_stage(events)
-                    transcripts.append((str(events), {
-                        "events": events,
-                        "diagnostics": directory / f"{prefix}run.log",
-                    }))
+            transcripts, stages = artifact_transcripts(
+                Path(path).parent for path in run.get("outputs", [])
+            )
+        self._send_transcripts(
+            transcripts, stages, query,
+            complete=run["status"] not in ACTIVE_STATUSES and run["status"] != "queued",
+            roots=[root, *self.app.allowed_roots],
+        )
+
+    def _send_review_codex(self, query: str) -> None:
+        key = parse_qs(query).get("key", [""])[0]
+        item = self.app.catalog.review_detail(key)
+        directories = []
+        if item.get("attemptDirectory"):
+            directories.append(Path(item["attemptDirectory"]))
+        directories.append(Path(item["paperDirectory"]) / item["problemId"])
+        self._send_saved_codex(directories, query)
+
+    def _send_catalog_codex(self, query: str) -> None:
+        values = parse_qs(query)
+        key = values.get("key", [""])[0]
+        kind = values.get("category", [""])[0]
+        with self.app.catalog.lock:
+            catalog = self.app.catalog.catalog
+            if kind == "paper":
+                items = catalog.get("papers", [])
+            elif kind == "draft":
+                items = [draft for manuscript in catalog.get("manuscripts", [])
+                         for draft in manuscript.get("drafts", [])]
+            else:
+                raise PlanError("unknown transcript category")
+            item = next((item for item in items if item["key"] == key), None)
+            if item is None:
+                raise KeyError(key)
+            directory = Path(item["path"])
+        if kind == "paper":
+            directory /= "analysis"
+        self._send_saved_codex([directory], query)
+
+    def _send_saved_codex(self, directories, query: str) -> None:
+        if any(not _is_allowed_file(path, self.app.allowed_roots) for path in directories):
+            raise PlanError("transcript is outside allowed roots")
+        transcripts, stages = artifact_transcripts(directories)
+        self._send_transcripts(
+            transcripts, stages, query, complete=True, roots=self.app.allowed_roots,
+        )
+
+    def _send_transcripts(self, transcripts, stages, query, *, complete, roots) -> None:
+        """Serve the same paged transcript format for tasks and saved reports."""
         values = parse_qs(query)
         if "index" not in values and "id" not in values:
-            self.send_json({"complete": run["status"] not in ACTIVE_STATUSES and run["status"] != "queued", "transcripts": [
+            self.send_json({"complete": complete, "transcripts": [
                 {"index": index, "id": key,
                  "label": f"Codex {index + 1}" + (f" · {stages[key]}" if stages.get(key) else ""),
-                 "legacy": not key.startswith("turn-")}
-                for index, (key, _) in enumerate(transcripts)
+                 "legacy": "prompt" not in files}
+                for index, (key, files) in enumerate(transcripts)
             ]})
             return
         try:
@@ -2468,7 +2509,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if kind not in files:
             raise PlanError("unknown transcript file")
         path = files[kind]
-        if not _is_allowed_file(path, [root, *self.app.allowed_roots]):
+        if not _is_allowed_file(path, roots):
             raise PlanError("transcript is outside allowed roots")
         data = b""
         size = 0
@@ -2479,7 +2520,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 source.seek(offset)
                 for line in source:
                     # Leave a partial live event for the next poll.
-                    if kind == "events" and not line.endswith(b"\n") and run["status"] in ACTIVE_STATUSES:
+                    if kind == "events" and not line.endswith(b"\n") and not complete:
                         break
                     data += line
                     if len(data) >= 256_000:
@@ -2488,7 +2529,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.send_json({
             "text": data.decode("utf-8", errors="replace"),
             "nextOffset": next_offset,
-            "complete": run["status"] not in ACTIVE_STATUSES and run["status"] != "queued" and next_offset >= size,
+            "complete": complete and next_offset >= size,
         })
 
     def _send_log(self, run_id: str, query: str) -> None:
